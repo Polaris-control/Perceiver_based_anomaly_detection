@@ -1,0 +1,81 @@
+name: Install pkg
+
+# see: https://help.github.com/en/actions/reference/events-that-trigger-workflows
+on:  # Trigger the workflow on push or pull request, but only for the master branch
+  push: {}
+  pull_request:
+    branches: [main]
+
+jobs:
+  pkg-check:
+    runs-on: ubuntu-20.04
+
+    steps:
+      - uses: actions/checkout@master
+        with:
+          lfs: true
+      - uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+
+      - name: Install Poetry
+        shell: bash -l {0}
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+
+      - name: Create package
+        run: |
+          pip install invoke
+          invoke clean
+          poetry build
+
+      - name: Verify package
+        run: |
+          pip install twine==3.2
+          twine check dist/*
+          invoke clean
+
+  pkg-install:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-20.04, windows-2019]
+        python-version: [3.9]
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v2
+        with:
+          python-version: ${{ matrix.python-version }}
+          lfs: true
+
+      - name: Install Poetry
+        uses: abatilo/actions-poetry@v2.0.0
+        with:
+          poetry-version: 1.2.2
+
+      - name: Prepare env
+        run: |
+          pip install "twine==3.2" invoke
+
+      - name: Create package
+        run: |
+          invoke clean
+          poetry build
+
+      - name: Install | Uninstall package - archive
+        run: |
+          # install as archive
+          pip install dist/*.tar.gz --find-links https://download.pytorch.org/whl/cpu/torch_stable.html
+          cd ..
+          python -c "import perceiver"
+          pip uninstall -y perceiver-io
+
+      - name: Install | Uninstall package - wheel
+        run: |
+          # install as wheel
+          pip install dist/*.whl --find-links https://download.pytorch.org/whl/cpu/torch_stable.html
+          cd ..
+          python -c "import perceiver"
+          pip uninstall -y perceiver-io

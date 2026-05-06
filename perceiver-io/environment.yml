@@ -1,0 +1,10 @@
+name: perceiver-io
+channels:
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.9
+  - pytorch-cuda=11.7
+  - pytorch=2.0
+  - torchvision=0.15
+  - pip>=22
