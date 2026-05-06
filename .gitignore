@@ -1,1 +1,4 @@
-"MVtec_ad/" 
+.idea/
+dist/
+
+.ruff_cache/
