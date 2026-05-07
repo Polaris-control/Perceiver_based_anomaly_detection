@@ -1,0 +1,1 @@
+from perceiver.data.vision import MVTecDataModule
