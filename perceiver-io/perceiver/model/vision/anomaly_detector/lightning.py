@@ -35,7 +35,7 @@ class LitAnomalyDetector(LitPerceiverIO):
         **kwargs: Any,
     ):
         self.save_hyperparameters()
-        
+
         super().__init__(encoder, decoder, *args, **kwargs)
 
         self.model = AnomalyDetector(
@@ -69,8 +69,8 @@ class LitAnomalyDetector(LitPerceiverIO):
         self.image_loss_fn = nn.BCEWithLogitsLoss()
 
         # Metrics
-        self.pixel_auroc = tm.classification.BinaryAUROC()
-        self.image_auroc = tm.classification.BinaryAUROC()
+        self.pixel_auroc = tm.AUROC(pos_label=1)
+        self.image_auroc = tm.AUROC(pos_label=1)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         return self.model(x)

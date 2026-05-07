@@ -32,7 +32,8 @@ MVTEC_CATEGORIES = [
 
 
 @dataclass
-class MVTecSample:
+class MVTecSample: 
+    #单张样本的数据结构（图片路径、mask、类别、是否异常…）
     image_path: Path
     mask_path: Optional[Path]
     category: str
@@ -41,6 +42,7 @@ class MVTecSample:
 
 
 def _default_test_categories(train_categories: Sequence[str]) -> List[str]:
+    #自动把没训练的类别当作测试类别
     train_set = set(train_categories)
     return [c for c in MVTEC_CATEGORIES if c not in train_set]
 
@@ -74,6 +76,7 @@ class MVTecDataset(Dataset):
 
         tfm: List[transforms.Compose] = []
         if augment:
+            #图像增强
             tfm.extend(
                 [
                     transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
@@ -103,7 +106,7 @@ class MVTecDataset(Dataset):
 
         self.image_transform = transforms.Compose(tfm)
 
-        # Mask keeps binary semantics, no imagenet normalize.
+        # Mask 用 NEAREST → 保持 0 和 1 不变（最近邻插值）
         mask_tfm: List[transforms.Compose] = [
             transforms.Resize((image_size, image_size), interpolation=Image.NEAREST),
             transforms.ToTensor(),  # shape (1, H, W), values in [0, 1]
@@ -190,6 +193,7 @@ class MVTecDataModule(pl.LightningDataModule):
         return 2
 
     def _collect_train_samples_for_category(self, category_dir: Path, category: str) -> List[MVTecSample]:
+        #训练集只使用正常样本 无监督/零样本异常检测
         samples: List[MVTecSample] = []
         good_dir = category_dir / "train" / "good"
         if not good_dir.exists():

@@ -32,11 +32,12 @@ class AnomalyDetectorCLI(CLI):
                 "model.decoder.num_cross_attention_heads": 1,
                 "model.decoder.dropout": 0.1,
                 "model.decoder.map_shape": [64, 64],
-                "model.decoder.num_output_channels": 1,
+                "model.decoder.num_output_channels": 1, #输出异常图
                 "model.decoder.score_pool": "topk_mean",
                 "model.decoder.score_topk_ratio": 0.01,
-                "model.pixel_loss_weight": 1.0,
+                "model.pixel_loss_weight": 1.0, 
                 "model.image_loss_weight": 0.0,
+                
             }
         )
 

@@ -212,7 +212,13 @@ class AnomalyDetector(PerceiverIO):
             num_latent_channels=config.num_latent_channels,
             activation_checkpointing=config.activation_checkpointing,
             activation_offloading=config.activation_offloading,
-            **config.decoder.base_kwargs(exclude=("num_output_query_channels", "num_output_channels", "map_shape", "score_pool", "score_topk_ratio")),
+            **config.decoder.base_kwargs(
+                exclude=(
+                "freeze",
+                "num_output_query_channels", 
+                "num_output_channels",
+                "map_shape", "score_pool", 
+                "score_topk_ratio")),
         )
 
         super().__init__(encoder, decoder)
