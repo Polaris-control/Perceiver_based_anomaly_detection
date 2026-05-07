@@ -122,7 +122,7 @@
 
 ---
 
-## 4. 关键代码说明（文件级）
+## 4. 关键代码说明
 
 ## `perceiver/data/vision/mvtec.py`
 核心职责：
@@ -188,17 +188,11 @@
 
 ---
 
-## 5. 当前已知风险与待完善项
 
-1. `perceiver/data/__init__.py` 仍为空（建议补统一导出）
-2. `perceiver/model/vision/anomaly_detector/metrics.py` 仍为空（建议抽离指标逻辑）
-3. `examples/anomaly/train.py` 为空（建议补最小复现实验脚本）
-4. `torchmetrics` 版本需与项目约束统一（避免 API 漂移）
-5. 数据真实目录需持续校验（确保图像和 mask 文件完整）
 
 ---
 
-## 6. 下一阶段计划（从现在到最终目标）
+## 5. 下一阶段计划（从现在到最终目标）
 
 ## 阶段 A：基线稳态训练（短期）
 目标：得到可信 baseline。
@@ -243,14 +237,3 @@
 
 ---
 
-## 7. 建议运行命令（当前可用）
-
-```bash
-python -m perceiver.scripts.vision.anomaly_detector fit \
-  --data=MVTecDataModule \
-  --data.dataset_dir="C:/Users/20763/Desktop/zero-shot/MVtec_ad/data" \
-  --optimizer=AdamW \
-  --optimizer.lr=1e-4 \
-  --trainer.max_epochs=1 \
-  --trainer.limit_train_batches=0.05 \
-  --trainer.limit_val_batches=0.2
