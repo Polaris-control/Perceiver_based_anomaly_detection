@@ -1,1 +1,1 @@
-from perceiver.data.vision.mnist import MNISTDataModule, MNISTPreprocessor
+from perceiver.data.vision.mvtec import MVTecDataModule
