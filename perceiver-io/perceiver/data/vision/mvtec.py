@@ -315,7 +315,7 @@ class MVTecDataModule(pl.LightningDataModule):
         return DataLoader(
             self.ds_val,
             batch_size=self.hparams.batch_size,
-            shuffle=False,
+            shuffle=True,#val 的 batch 顺序打乱
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
         )
@@ -324,7 +324,7 @@ class MVTecDataModule(pl.LightningDataModule):
         return DataLoader(
             self.ds_test,
             batch_size=self.hparams.batch_size,
-            shuffle=False,
+            shuffle=True,#test 的 batch 顺序打乱
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
         )

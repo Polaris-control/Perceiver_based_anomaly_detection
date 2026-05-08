@@ -37,7 +37,6 @@ class AnomalyDetectorCLI(CLI):
                 "model.decoder.score_topk_ratio": 0.01,
                 "model.pixel_loss_weight": 1.0, 
                 "model.image_loss_weight": 0.0,
-                
             }
         )
 

@@ -133,12 +133,16 @@ class LitAnomalyDetector(LitPerceiverIO):
             pred_prob = torch.sigmoid(pred_logits)
             pix_pred = self._flatten_pixel_scores(pred_prob)
             pix_true = self._flatten_pixel_scores(y_mask).long()
+
+            if pix_true.min() < pix_true.max():
+                self.pixel_auroc.update(pix_pred, pix_true)
             
-            self.pixel_auroc.update(pix_pred, pix_true)
+            
             if "image_score" in outputs and "label" in batch:
                 img_pred = outputs["image_score"].float().view(-1)
                 img_true = batch["label"].long().view(-1)
-                self.image_auroc.update(img_pred, img_true)
+                if img_true.min() < img_true.max():
+                    self.image_auroc.update(img_pred, img_true)
 
         return loss
 

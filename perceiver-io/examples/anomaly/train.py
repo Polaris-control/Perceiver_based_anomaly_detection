@@ -43,11 +43,18 @@ def main():
     encoder = AnomalyEncoderConfig(
         image_shape=dm.image_shape,  # (256,256,3)
         num_frequency_bands=64,
+        num_cross_attention_heads=1,
+        num_self_attention_heads=8,
+        num_self_attention_layers_per_block=2,
+        num_self_attention_blocks=1,
+        num_cross_attention_layers=1,
+        dropout=0.1,
     )
     decoder = AnomalyDecoderConfig(
         map_shape=(64, 64),
         num_output_query_channels=256,
         num_output_channels=1,
+        num_cross_attention_heads=1,
         score_pool="topk_mean",
         score_topk_ratio=0.01,
         dropout=0.1,
@@ -56,8 +63,8 @@ def main():
     model = LitAnomalyDetector(
         encoder=encoder,
         decoder=decoder,
-        num_latents=512,
-        num_latent_channels=1024,
+        num_latents=256,
+        num_latent_channels=512,
         pixel_loss_weight=1.0,
         image_loss_weight=0.0,
     )
@@ -72,11 +79,11 @@ def main():
     trainer = Trainer(
         accelerator="auto",
         devices=1,
-        max_epochs=1,
+        max_epochs=20,
         logger=TensorBoardLogger(save_dir="logs", name="anomaly"),
         log_every_n_steps=1,
         limit_train_batches=0.05,
-        limit_val_batches=0.2,
+        limit_val_batches=1.0,
     )
 
     trainer.fit(model, datamodule=dm)
