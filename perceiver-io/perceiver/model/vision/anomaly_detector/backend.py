@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +24,7 @@ from perceiver.model.core import (
 class AnomalyEncoderConfig(EncoderConfig):
     image_shape: Tuple[int, int, int] = (256, 256, 3)
     num_frequency_bands: int = 64
+    params: Optional[str] = None
 
 
 @dataclass

@@ -1,8 +1,9 @@
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
-import torchmetrics as tm
+import torch.nn.functional as F
 from torch import nn
+from torch.optim import AdamW
 
 from perceiver.model.core.lightning import LitPerceiverIO, is_checkpoint
 from perceiver.model.vision.anomaly_detector.backend import (
@@ -11,31 +12,30 @@ from perceiver.model.vision.anomaly_detector.backend import (
     AnomalyDetectorConfig,
     AnomalyEncoderConfig,
 )
+from perceiver.model.vision.anomaly_detector.metrics import (
+    compute_and_reset,
+    make_auroc_metrics,
+    update_image_auroc,
+    update_pixel_auroc,
+)
 
 
 class LitAnomalyDetector(LitPerceiverIO):
-    """
-    Expected batch fields:
-      - batch["image"]: (B, H, W, C), float
-      - batch["mask"]:  (B, H, W, 1) or (B, 1, H, W), float in {0,1}
-      - batch["label"]: (B,), optional (image-level 0/1)
-
-    Expected model outputs (dict):
-      - outputs["anomaly_logits"]: (B, H, W, 1)  # pixel-level logits
-      - outputs["image_score"]: (B,), optional   # image-level score/logit
-    """
-
     def __init__(
         self,
         encoder: AnomalyEncoderConfig,
         decoder: AnomalyDecoderConfig,
         pixel_loss_weight: float = 1.0,
-        image_loss_weight: float = 0.0,
+        image_loss_weight: float = 0.1,
+        pixel_pos_weight: float = 20.0,  # E1: class imbalance fix
+        loss_type: str = "bce",
+        focal_gamma: float = 2.0,
+        encoder_lr: Optional[float] = None,
+        decoder_lr: Optional[float] = None,
         *args: Any,
         **kwargs: Any,
     ):
         self.save_hyperparameters()
-
         super().__init__(encoder, decoder, *args, **kwargs)
 
         self.model = AnomalyDetector(
@@ -49,7 +49,22 @@ class LitAnomalyDetector(LitPerceiverIO):
             )
         )
 
-        # Optional checkpoint init (same style as existing modules)
+        encoder_params = getattr(self.hparams.encoder, "params", None)
+        if encoder_params is not None:
+            if is_checkpoint(encoder_params):
+                from perceiver.model.vision.image_classifier.lightning import LitImageClassifier
+
+                source_model = LitImageClassifier.load_from_checkpoint(encoder_params, params=None)
+                state_dict = source_model.model.encoder.state_dict()
+            else:
+                from perceiver.model.vision.image_classifier.huggingface import PerceiverImageClassifier
+
+                source_model = PerceiverImageClassifier.from_pretrained(encoder_params)
+                state_dict = source_model.backend_model.encoder.state_dict()
+
+            missing, unexpected = self.model.encoder.load_state_dict(state_dict, strict=False)
+            print(f"Loaded pretrained encoder. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+
         if self.hparams.params is not None:
             if is_checkpoint(self.hparams.params):
                 wrapper = LitAnomalyDetector.load_from_checkpoint(self.hparams.params, params=None)
@@ -63,21 +78,17 @@ class LitAnomalyDetector(LitPerceiverIO):
         self.pixel_loss_weight = pixel_loss_weight
         self.image_loss_weight = image_loss_weight
 
-        # Pixel segmentation loss on logits + binary mask
-        self.pixel_loss_fn = nn.BCEWithLogitsLoss()
-        # Optional image-level loss if label/image_score exists
-        self.image_loss_fn = nn.BCEWithLogitsLoss()
+        # Register as buffer so it moves with device
+        self.register_buffer("pixel_pos_weight", torch.tensor(float(pixel_pos_weight), dtype=torch.float32))
 
-        # Metrics
-        self.pixel_auroc = tm.AUROC(pos_label=1)
-        self.image_auroc = tm.AUROC(pos_label=1)
+        self.image_loss_fn = nn.BCEWithLogitsLoss()
+        self.pixel_auroc, self.image_auroc = make_auroc_metrics()
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         return self.model(x)
 
     @staticmethod
     def _mask_to_channels_last(mask: torch.Tensor) -> torch.Tensor:
-        # Accept both (B, H, W, 1) and (B, 1, H, W), return (B, H, W, 1)
         if mask.ndim != 4:
             raise ValueError(f"Expected 4D mask, got shape={tuple(mask.shape)}")
         if mask.shape[-1] == 1:
@@ -85,11 +96,6 @@ class LitAnomalyDetector(LitPerceiverIO):
         if mask.shape[1] == 1:
             return mask.permute(0, 2, 3, 1).contiguous()
         raise ValueError(f"Unsupported mask shape: {tuple(mask.shape)}")
-
-    @staticmethod
-    def _flatten_pixel_scores(x: torch.Tensor) -> torch.Tensor:
-        # (B, H, W, 1) -> (B*H*W,)
-        return x.reshape(-1)
 
     def step(self, batch: Dict[str, Any], stage: str):
         x = batch["image"]
@@ -105,10 +111,20 @@ class LitAnomalyDetector(LitPerceiverIO):
                 f"Shape mismatch: anomaly_logits={tuple(pred_logits.shape)} vs mask={tuple(y_mask.shape)}"
             )
 
-        # Pixel-level loss
-        loss_pix = self.pixel_loss_fn(pred_logits, y_mask)
+        if self.hparams.loss_type == "focal":
+            loss_pix = self._focal_bce_with_logits(
+                pred_logits,
+                y_mask,
+                gamma=float(self.hparams.focal_gamma),
+            )
+        else:
+            # E1: weighted BCE for sparse anomaly pixels
+            loss_pix = F.binary_cross_entropy_with_logits(
+                pred_logits,
+                y_mask,
+                pos_weight=self.pixel_pos_weight.to(pred_logits.device),
+            )
 
-        # Optional image-level loss (if both provided)
         loss_img = torch.tensor(0.0, device=pred_logits.device)
         use_image_loss = (
             self.image_loss_weight > 0.0
@@ -122,27 +138,18 @@ class LitAnomalyDetector(LitPerceiverIO):
 
         loss = self.pixel_loss_weight * loss_pix + self.image_loss_weight * loss_img
 
-        # Logs
-        self.log(f"{stage}_loss", loss, prog_bar=(stage != "train"), sync_dist=(stage != "train"))
-        self.log(f"{stage}_loss_pix", loss_pix, prog_bar=(stage != "train"), sync_dist=(stage != "train"))
+        bs = x.shape[0]
+        self.log(f"{stage}_loss", loss, prog_bar=(stage != "train"), sync_dist=(stage != "train"), batch_size=bs)
+        self.log(f"{stage}_loss_pix", loss_pix, prog_bar=(stage != "train"), sync_dist=(stage != "train"), batch_size=bs)
         if use_image_loss:
-            self.log(f"{stage}_loss_img", loss_img, prog_bar=False, sync_dist=(stage != "train"))
+            self.log(f"{stage}_loss_img", loss_img, prog_bar=False, sync_dist=(stage != "train"), batch_size=bs)
 
-        # Metrics (AUROC)
         with torch.no_grad():
             pred_prob = torch.sigmoid(pred_logits)
-            pix_pred = self._flatten_pixel_scores(pred_prob)
-            pix_true = self._flatten_pixel_scores(y_mask).long()
+            update_pixel_auroc(self.pixel_auroc, pred_prob, y_mask)
 
-            if pix_true.min() < pix_true.max():
-                self.pixel_auroc.update(pix_pred, pix_true)
-            
-            
             if "image_score" in outputs and "label" in batch:
-                img_pred = outputs["image_score"].float().view(-1)
-                img_true = batch["label"].long().view(-1)
-                if img_true.min() < img_true.max():
-                    self.image_auroc.update(img_pred, img_true)
+                update_image_auroc(self.image_auroc, outputs["image_score"], batch["label"])
 
         return loss
 
@@ -156,26 +163,45 @@ class LitAnomalyDetector(LitPerceiverIO):
         self.step(batch, stage="test")
 
     def on_validation_epoch_end(self):
-        pixel_auc = self.pixel_auroc.compute()
-        self.log("val_pixel_auroc", pixel_auc, prog_bar=True, sync_dist=True)
-        self.pixel_auroc.reset()
+        pixel_auc = compute_and_reset(self.pixel_auroc)
+        if pixel_auc is not None:
+            self.log("val_pixel_auroc", pixel_auc, prog_bar=True, sync_dist=True)
 
-        # image AUROC is optional (only if image_score/label were present)
-        try:
-            image_auc = self.image_auroc.compute()
+        image_auc = compute_and_reset(self.image_auroc)
+        if image_auc is not None:
             self.log("val_image_auroc", image_auc, prog_bar=True, sync_dist=True)
-        except Exception:
-            pass
-        self.image_auroc.reset()
 
     def on_test_epoch_end(self):
-        pixel_auc = self.pixel_auroc.compute()
-        self.log("test_pixel_auroc", pixel_auc, sync_dist=True)
-        self.pixel_auroc.reset()
+        pixel_auc = compute_and_reset(self.pixel_auroc)
+        if pixel_auc is not None:
+            self.log("test_pixel_auroc", pixel_auc, sync_dist=True)
 
-        try:
-            image_auc = self.image_auroc.compute()
+        image_auc = compute_and_reset(self.image_auroc)
+        if image_auc is not None:
             self.log("test_image_auroc", image_auc, sync_dist=True)
-        except Exception:
-            pass
-        self.image_auroc.reset()
+
+    def _focal_bce_with_logits(self, logits, targets, gamma: float):
+        bce = F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            reduction="none",
+            pos_weight=self.pixel_pos_weight.to(logits.device),
+        )
+        p = torch.sigmoid(logits)
+        pt = p * targets + (1.0 - p) * (1.0 - targets)
+        return ((1.0 - pt).pow(gamma) * bce).mean()
+
+    def configure_optimizers(self):
+        if self.hparams.encoder_lr is not None and self.hparams.decoder_lr is not None:
+            encoder_params = list(self.model.encoder.parameters())
+            encoder_param_ids = {id(p) for p in encoder_params}
+            decoder_params = [p for p in self.model.parameters() if id(p) not in encoder_param_ids]
+
+            return AdamW(
+                [
+                    {"params": encoder_params, "lr": float(self.hparams.encoder_lr)},
+                    {"params": decoder_params, "lr": float(self.hparams.decoder_lr)},
+                ]
+            )
+
+        return AdamW(self.parameters(), lr=1e-4)

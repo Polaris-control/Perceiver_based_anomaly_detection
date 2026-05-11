@@ -11,6 +11,7 @@ from perceiver.model.vision.anomaly_detector.lightning import LitAnomalyDetector
 
 def main():
     dataset_dir = "C:/Users/20763/Desktop/zero-shot/MVtec_ad/data"
+    single_category = "bottle"  # e.g. "bottle" for Line-2 one-class validation
 
     # Example: 10 seen (train), 5 unseen (val/test) — adjust freely
     train_categories = [
@@ -26,6 +27,9 @@ def main():
         "screw",
     ]
     test_categories = ["tile", "toothbrush", "transistor", "wood", "zipper"]
+    if single_category is not None:
+        train_categories = [single_category]
+        test_categories = [single_category]
 
     dm = MVTecDataModule(
         dataset_dir=dataset_dir,
@@ -49,9 +53,10 @@ def main():
         num_self_attention_blocks=1,
         num_cross_attention_layers=1,
         dropout=0.1,
+        params="deepmind/vision-perceiver-fourier",
     )
     decoder = AnomalyDecoderConfig(
-        map_shape=(64, 64),
+        map_shape=(128, 128),
         num_output_query_channels=256,
         num_output_channels=1,
         num_cross_attention_heads=1,
@@ -66,13 +71,16 @@ def main():
         num_latents=256,
         num_latent_channels=512,
         pixel_loss_weight=1.0,
-        image_loss_weight=0.0,
+        image_loss_weight=0.1,
+        pixel_pos_weight=20.0,
+        loss_type="focal",
+        focal_gamma=1.5,
     )
 
     # Lightning requires configure_optimizers OR pass optimizer via CLI.
     # Here we define it by monkey-patching for minimal reproducibility:
     def configure_optimizers():
-        return AdamW(model.parameters(), lr=1e-4)
+        return AdamW(model.parameters(), lr=5e-5)
 
     model.configure_optimizers = configure_optimizers  # minimal, explicit
 
@@ -82,7 +90,7 @@ def main():
         max_epochs=20,
         logger=TensorBoardLogger(save_dir="logs", name="anomaly"),
         log_every_n_steps=1,
-        limit_train_batches=0.05,
+        limit_train_batches=0.5,
         limit_val_batches=1.0,
     )
 

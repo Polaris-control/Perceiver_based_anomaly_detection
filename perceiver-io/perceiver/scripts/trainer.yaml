@@ -1,4 +1,5 @@
 trainer:
+  max_epochs: 20
   callbacks:
   - class_path: pytorch_lightning.callbacks.lr_monitor.LearningRateMonitor
     init_args:
@@ -6,9 +7,10 @@ trainer:
       log_momentum: false
   - class_path: pytorch_lightning.callbacks.model_checkpoint.ModelCheckpoint
     init_args:
-      monitor: 'val_loss'
-      filename: '{epoch:03d}-{val_loss:.3f}'
-      mode: min
+      monitor: 'val_pixel_auroc'
+      filename: '{epoch:03d}-{val_pixel_auroc:.3f}'
+      mode: max
       save_weights_only: true
+      save_top_k: 1
   default_root_dir: logs
   strategy: ddp_find_unused_parameters_false
