@@ -35,9 +35,9 @@ def main():
         dataset_dir=dataset_dir,
         train_categories=train_categories,
         test_categories=test_categories,
-        image_size=256,
+        image_size=224,
         batch_size=8,
-        num_workers=4,
+        num_workers=0,
         pin_memory=True,
         train_augment=True,
         include_test_good=True,
@@ -45,18 +45,18 @@ def main():
     dm.setup()
 
     encoder = AnomalyEncoderConfig(
-        image_shape=dm.image_shape,  # (256,256,3)
+        image_shape=dm.image_shape,  # (224,224,3)
         num_frequency_bands=64,
         num_cross_attention_heads=1,
         num_self_attention_heads=8,
-        num_self_attention_layers_per_block=2,
+        num_self_attention_layers_per_block=4,
         num_self_attention_blocks=1,
         num_cross_attention_layers=1,
         dropout=0.1,
-        params="deepmind/vision-perceiver-fourier",
+        params="C:/Users/20763/Desktop/zero-shot/perceiver-io/logs/mvtec_224_10class_pretrain/version_0/checkpoints/epoch=19-step=6600.ckpt",
     )
     decoder = AnomalyDecoderConfig(
-        map_shape=(128, 128),
+        map_shape=(112, 112),
         num_output_query_channels=256,
         num_output_channels=1,
         num_cross_attention_heads=1,
@@ -68,29 +68,24 @@ def main():
     model = LitAnomalyDetector(
         encoder=encoder,
         decoder=decoder,
-        num_latents=256,
-        num_latent_channels=512,
+        num_latents=512,
+        num_latent_channels=1024,
         pixel_loss_weight=1.0,
         image_loss_weight=0.1,
         pixel_pos_weight=20.0,
         loss_type="focal",
         focal_gamma=1.5,
+        encoder_lr=None,    # Encoder 不训练
+        decoder_lr=1e-4,    # 只训练 Decoder
     )
-
-    # Lightning requires configure_optimizers OR pass optimizer via CLI.
-    # Here we define it by monkey-patching for minimal reproducibility:
-    def configure_optimizers():
-        return AdamW(model.parameters(), lr=5e-5)
-
-    model.configure_optimizers = configure_optimizers  # minimal, explicit
-
+    
     trainer = Trainer(
         accelerator="auto",
         devices=1,
-        max_epochs=20,
-        logger=TensorBoardLogger(save_dir="logs", name="anomaly"),
+        max_epochs=10,
+        logger=TensorBoardLogger(save_dir="logs", name="one-class-anomaly"),
         log_every_n_steps=1,
-        limit_train_batches=0.5,
+        limit_train_batches=1.0,
         limit_val_batches=1.0,
     )
 
