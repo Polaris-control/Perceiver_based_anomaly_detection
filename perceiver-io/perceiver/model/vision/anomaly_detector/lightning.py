@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
@@ -28,8 +29,8 @@ class LitAnomalyDetector(LitPerceiverIO):
         pixel_loss_weight: float = 1.0,
         image_loss_weight: float = 0.1,
         pixel_pos_weight: float = 20.0,  # E1: class imbalance fix
-        loss_type: str = "bce",
-        focal_gamma: float = 2.0,
+        loss_type: str = "focal",
+        focal_gamma: float = 1.5,
         encoder_lr: Optional[float] = None,
         decoder_lr: Optional[float] = None,
         *args: Any,
@@ -52,13 +53,22 @@ class LitAnomalyDetector(LitPerceiverIO):
         encoder_params = getattr(self.hparams.encoder, "params", None)
         if encoder_params is not None:
             if is_checkpoint(encoder_params):
+                ckpt_path = Path(encoder_params)
+                if not ckpt_path.exists():
+                    raise FileNotFoundError(
+                        "Encoder checkpoint not found: "
+                        f"{ckpt_path}. Train a classifier first (for example, "
+                        "`python examples/training/img_clf/train_my_256_clf.py`) "
+                        "or set `encoder.params` to a valid HuggingFace model id."
+                    )
+                #加载本地训练的 .ckpt 
                 from perceiver.model.vision.image_classifier.lightning import LitImageClassifier
 
                 source_model = LitImageClassifier.load_from_checkpoint(encoder_params, params=None)
                 state_dict = source_model.model.encoder.state_dict()
             else:
                 from perceiver.model.vision.image_classifier.huggingface import PerceiverImageClassifier
-
+                #直接加载 HuggingFace模型 
                 source_model = PerceiverImageClassifier.from_pretrained(encoder_params)
                 state_dict = source_model.backend_model.encoder.state_dict()
 
@@ -191,7 +201,7 @@ class LitAnomalyDetector(LitPerceiverIO):
         pt = p * targets + (1.0 - p) * (1.0 - targets)
         return ((1.0 - pt).pow(gamma) * bce).mean()
 
-    def configure_optimizers(self):
+    """ def configure_optimizers(self):
         if self.hparams.encoder_lr is not None and self.hparams.decoder_lr is not None:
             encoder_params = list(self.model.encoder.parameters())
             encoder_param_ids = {id(p) for p in encoder_params}
@@ -204,4 +214,13 @@ class LitAnomalyDetector(LitPerceiverIO):
                 ]
             )
 
-        return AdamW(self.parameters(), lr=1e-4)
+        return AdamW(self.parameters(), lr=1e-4) """
+
+    def configure_optimizers(self):
+    # 冻结 Encoder！
+        for param in self.model.encoder.parameters():
+            param.requires_grad = False
+
+        # 只训练 decoder
+        from torch.optim import AdamW
+        return AdamW(self.model.decoder.parameters(), lr=1e-4)
