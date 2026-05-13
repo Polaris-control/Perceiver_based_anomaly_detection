@@ -22,15 +22,15 @@ from perceiver.model.core import (
 
 @dataclass
 class AnomalyEncoderConfig(EncoderConfig):
-    image_shape: Tuple[int, int, int] = (256, 256, 3)
-    num_frequency_bands: int = 64
+    image_shape: Tuple[int, int, int] = (224, 224, 3)
+    num_frequency_bands: int = 32
     params: Optional[str] = None
 
 
 @dataclass
 class AnomalyDecoderConfig(DecoderConfig):
     # spatial query grid (low-res map). final map is resized to image_shape.
-    map_shape: Tuple[int, int] = (64, 64)
+    map_shape: Tuple[int, int] = (112, 112)
     num_output_query_channels: int = 256
     num_output_channels: int = 1
     score_pool: str = "topk_mean"  # "max", "mean", "topk_mean"
