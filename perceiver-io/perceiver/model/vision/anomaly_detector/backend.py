@@ -121,6 +121,10 @@ class AnomalyMapOutputAdapter(OutputAdapter):
         self.score_pool = score_pool
         self.score_topk_ratio = score_topk_ratio
         self.linear = nn.Linear(num_output_query_channels, num_output_channels)
+        # 勿对所有 weight 填同一常数（会导致整图 logit 高度相关、空间方差≈0）。
+        nn.init.xavier_uniform_(self.linear.weight)
+        # 略偏「背景」先验，与稀疏 mask 大致同量级；训练仍主要靠损失拉回。
+        nn.init.constant_(self.linear.bias, 0.0)
 
     def _pool_image_score(self, logits_map: torch.Tensor) -> torch.Tensor:
         # logits_map: (B, H, W, 1)
