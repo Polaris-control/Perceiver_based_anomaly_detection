@@ -69,10 +69,12 @@ class MVTecDataset(Dataset):
         channels_last: bool = True,
         normalize_imagenet: bool = True,
         augment: bool = False,
+        use_synthetic_anomaly: bool = False,  # 新增：训练时才打开
     ):
         self.samples = samples
         self.image_size = image_size
         self.channels_last = channels_last
+        self.use_synthetic_anomaly = use_synthetic_anomaly
 
         tfm: List[transforms.Compose] = []
         if augment:
@@ -113,6 +115,38 @@ class MVTecDataset(Dataset):
         ]
         self.mask_transform = transforms.Compose(mask_tfm)
 
+    def _synthesize_anomaly(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        给正常图加伪异常，同时生成伪 mask
+        x: 已经 transform 完的图像shape: (H, W, C)channels_last
+        返回: (augmented_x, synthetic_mask)
+        """
+        H, W, C = x.shape
+        mask = torch.zeros((H, W, 1), dtype=torch.float32, device=x.device)
+
+        #随机生成一个矩形异常区域（模拟划痕、凹陷、污渍）
+        # 保证区域足够大，不会太小
+        x1 = torch.randint(0, W // 2, (1,)).item()
+        y1 = torch.randint(0, H // 2, (1,)).item()
+        x2 = torch.randint(x1 + W // 8, W, (1,)).item()
+        y2 = torch.randint(y1 + H // 8, H, (1,)).item()
+
+        # 给这个区域加扰动（模拟异常纹理）
+        # 因为 x 已经是 imagenet 归一化后的，所以扰动也要在这个空间
+        noise = torch.randn_like(x[y1:y2, x1:x2, :]) * 0.3  # 小扰动，不破坏原图
+        x[y1:y2, x1:x2, :] = x[y1:y2, x1:x2, :] + noise
+
+        #标记 mask：异常区域=1
+        mask[y1:y2, x1:x2, 0] = 1.0
+
+        # 加一点随机噪声异常（模拟微小杂质）
+        rand_noise_mask = torch.rand_like(mask) < 0.01  # 1% 像素随机异常
+        rand_noise = torch.randn_like(x) * 0.1
+        x[rand_noise_mask.squeeze(-1), :] = x[rand_noise_mask.squeeze(-1), :] + rand_noise[rand_noise_mask.squeeze(-1), :]
+        mask = torch.logical_or(mask.bool(), rand_noise_mask).float()
+
+        return x, mask
+
     def __len__(self):
         return len(self.samples)
 
@@ -139,9 +173,19 @@ class MVTecDataset(Dataset):
         x = self.image_transform(img)  # (H, W, C) if channels_last else (C, H, W)
         m = self._load_mask(s.mask_path, self.image_size)
 
+        # 训练时：如果开启了 synthetic anomaly，给 good 图加伪异常
+        if self.use_synthetic_anomaly:
+            # 只有训练集才会进来，x 是 transform 完的 good 图
+            x, m = self._synthesize_anomaly(x)
+            # 图像级 label 改成 1（因为我们加了异常）
+            label = torch.tensor(1, dtype=torch.long)
+        else:
+            # 验证/测试：用原来的 label
+            label = torch.tensor(s.is_anomaly, dtype=torch.long)
+
         return {
             "image": x,
-            "label": torch.tensor(s.is_anomaly, dtype=torch.long),
+            "label": label,
             "mask": m,
             "category": s.category,
             "defect_type": s.defect_type,
@@ -286,6 +330,7 @@ class MVTecDataModule(pl.LightningDataModule):
             channels_last=self.hparams.channels_last,
             normalize_imagenet=self.hparams.normalize_imagenet,
             augment=self.hparams.train_augment,
+            use_synthetic_anomaly = True, #训练集 开伪异常
         )
         self.ds_val = MVTecDataset(
             val_samples,
@@ -293,6 +338,7 @@ class MVTecDataModule(pl.LightningDataModule):
             channels_last=self.hparams.channels_last,
             normalize_imagenet=self.hparams.normalize_imagenet,
             augment=False,
+            use_synthetic_anomaly = False, #验证关， 用真实异常
         )
         self.ds_test = MVTecDataset(
             test_samples,
@@ -300,6 +346,7 @@ class MVTecDataModule(pl.LightningDataModule):
             channels_last=self.hparams.channels_last,
             normalize_imagenet=self.hparams.normalize_imagenet,
             augment=False,
+            use_synthetic_anomaly = False, # 测试关，用真实异常
         )
 
     def train_dataloader(self):
