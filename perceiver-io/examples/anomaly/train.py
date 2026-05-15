@@ -53,7 +53,7 @@ def main():
         num_self_attention_blocks=1,
         num_cross_attention_layers=1,
         dropout=0.1,
-        params="C:/Users/20763/Desktop/zero-shot/perceiver-io/logs/mvtec_224_10class_pretrain/version_0/checkpoints/epoch=19-step=6600.ckpt",
+        params =r"C:\Users\20763\Desktop\zero-shot\perceiver-io\logs\mvtec_224_10class_pretrain\version_0\checkpoints\epoch=19-step=6600.ckpt",
     )
     decoder = AnomalyDecoderConfig(
         map_shape=(112, 112),
@@ -71,22 +71,30 @@ def main():
         num_latents=512,
         num_latent_channels=1024,
         pixel_loss_weight=1.0,
-        image_loss_weight=0.1,
-        pixel_pos_weight=20.0,
-        loss_type="focal",
-        focal_gamma=1.5,
-        encoder_lr=None,    # Encoder 不训练
-        decoder_lr=1e-4,    # 只训练 Decoder
+        image_loss_weight=0.0,
+        pixel_pos_weight=2.0, #减弱 focal 与 pos_weight 调试
+        loss_type="bce",
+        focal_gamma=1.0,
+        encoder_lr=None,
+        use_lora=True,
+        lora_rank=8,
+        lora_alpha=8.0,
+        lora_dropout=0.05,
+        lora_target_projs=("q_proj", "v_proj"),
+        lora_lr=5e-5,
+        decoder_lr=5e-5,
     )
     
     trainer = Trainer(
         accelerator="auto",
         devices=1,
         max_epochs=10,
-        logger=TensorBoardLogger(save_dir="logs", name="one-class-anomaly"),
+        logger=TensorBoardLogger(save_dir="logs", name="one-class-anomaly_test"),
         log_every_n_steps=1,
         limit_train_batches=1.0,
         limit_val_batches=1.0,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
     )
 
     trainer.fit(model, datamodule=dm)
