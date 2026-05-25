@@ -31,10 +31,11 @@ class LinearWithLoRA(nn.Module):
         self.alpha = float(alpha)
         self.scaling = self.alpha / self.rank
 
+        # 低秩矩阵 A, B
         self.lora_a = nn.Parameter(torch.empty(linear.in_features, rank))
         self.lora_b = nn.Parameter(torch.empty(rank, linear.out_features))
         nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_b) # lora_b初始化为0
+        nn.init.zeros_(self.lora_b)
         self.dropout = nn.Dropout(dropout) if dropout and dropout > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -48,7 +49,7 @@ def inject_lora_into_encoder(
     rank: int,
     alpha: float,
     dropout: float = 0.0,
-    target_proj_names: Sequence[str] = ("q_proj", "v_proj"),
+    target_proj_names: Sequence[str] = ("q_proj","k_proj","v_proj"),
 ) -> Tuple[int, int]:
     """
     Wrap selected projections on every MultiHeadAttention under ``encoder``.
