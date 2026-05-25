@@ -1,6 +1,4 @@
-以下是根据您的实验项目生成的中文 GitHub README.md 文件：
 
-```markdown
 # Perceiver 异常检测：面积正则化与排序优化
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
