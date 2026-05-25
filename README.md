@@ -44,14 +44,14 @@
 
 ## 主要特点
 
-- ✅ **仅使用正常图像训练**，无需真实缺陷样本
-- ✅ **跨类别评估**（训练10类，测试5类），严格检验泛化能力
-- ✅ **Perceiver IO 主干** – 线性复杂度、灵活解码、保留像素级位置信息
-- ✅ **LoRA** – 参数高效微调，避免过拟合
-- ✅ **5种合成异常** + 不规则多边形 mask，增强数据多样性
-- ✅ **面积正则化 + 排序损失**，同时提升校准与 AUROC 稳定性
-- ✅ **详细日志记录**（梯度、预测分布、面积相关性等）
-- ✅ **丰富的可视化工具**（热力图、ROC 曲线、logits 直方图）
+-  **仅使用正常图像训练**，无需真实缺陷样本
+-  **跨类别评估**（训练10类，测试5类），严格检验泛化能力
+-  **Perceiver IO 主干** – 线性复杂度、灵活解码、保留像素级位置信息
+-  **LoRA** – 参数高效微调，避免过拟合
+-  **5种合成异常** + 不规则多边形 mask，增强数据多样性
+-  **面积正则化 + 排序损失**，同时提升校准与 AUROC 稳定性
+-  **详细日志记录**（梯度、预测分布、面积相关性等）
+-  **丰富的可视化工具**（热力图、ROC 曲线、logits 直方图）
 
 ---
 
@@ -221,16 +221,3 @@ perceiver-io/
 
 ---
 
-## 致谢
-
-- [Perceiver IO](https://github.com/deepmind/deepmind-research/tree/master/perceiver) – DeepMind
-- [PyTorch Lightning](https://www.pytorchlightning.ai/)
-- [MVTec AD 数据集](https://www.mvtec.com/company/research/datasets/mvtec-ad)
-- LoRA: [Hu et al., LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
-
----
-
-**许可证**：MIT
-
-如有问题或建议，欢迎提 issue。欢迎贡献代码！
-```
