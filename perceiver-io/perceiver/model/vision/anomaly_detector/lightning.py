@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from perceiver.model.core.lightning import LitPerceiverIO, is_checkpoint
 from perceiver.model.vision.anomaly_detector.backend import (
@@ -31,9 +32,7 @@ from perceiver.model.vision.anomaly_detector.metrics import (
 
 _DEBUG_LOG_PATH = Path(r"C:\Users\20763\Desktop\zero-shot\debug-198037.log")
 
-#假设并添加 NDJSON 日志：验证 AUROC 是否因跳过 update 而失真、梯度是否爆炸/消失、预测是否塌缩、损失与 mask 分布
 def _agent_debug_log(hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
-    # region agent log
     payload = {
         "sessionId": "198037",
         "hypothesisId": hypothesis_id,
@@ -41,14 +40,13 @@ def _agent_debug_log(hypothesis_id: str, location: str, message: str, data: Dict
         "message": message,
         "data": data,
         "timestamp": int(time.time() * 1000),
-        "runId": "post-fix-v4",
+        "runId": "post-fix-v8",
     }
     try:
         with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
         pass
-    # endregion
 
 
 class LitAnomalyDetector(LitPerceiverIO):
@@ -57,18 +55,26 @@ class LitAnomalyDetector(LitPerceiverIO):
         encoder: AnomalyEncoderConfig,
         decoder: AnomalyDecoderConfig,
         pixel_loss_weight: float = 1.0,
-        image_loss_weight: float = 0.1,
-        pixel_pos_weight: float = 2.0,  
-        loss_type: str = "bce",
-        focal_gamma: float = 1.5,
+        image_loss_weight: float = 0.0,
+        pixel_pos_weight: float = 5.0,
+        loss_type: str = "focal",
+        focal_gamma: float = 2.0,
+        dice_loss_weight: float = 0.05,
+        dice_smooth: float = 1.0,
         encoder_lr: Optional[float] = None,
         decoder_lr: Optional[float] = None,
         use_lora: bool = False,
         lora_rank: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
-        lora_target_projs: Tuple[str, ...] = ("q_proj", "v_proj"),
+        lora_target_projs: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj"),
         lora_lr: Optional[float] = None,
+        area_loss_weight: float = 1.0,
+        edge_loss_weight: float = 0.0,
+        focal_alpha: float = 0.25,
+        ranking_loss_weight: float = 0.3,          # Ranking loss 权重，推荐 0.3
+        use_hard_mining: bool = False,              # Hard Negative Mining 开关（默认关闭）
+        hard_neg_ratio: float = 0.05,               # 仅当 use_hard_mining=True 时生效
         *args: Any,
         **kwargs: Any,
     ):
@@ -86,6 +92,7 @@ class LitAnomalyDetector(LitPerceiverIO):
             )
         )
 
+        # 加载预训练编码器权重（分类器）
         encoder_params = getattr(self.hparams.encoder, "params", None)
         if encoder_params is not None:
             if is_checkpoint(encoder_params):
@@ -97,21 +104,17 @@ class LitAnomalyDetector(LitPerceiverIO):
                         "`python examples/training/img_clf/train_my_256_clf.py`) "
                         "or set `encoder.params` to a valid HuggingFace model id."
                     )
-                #加载本地训练的 .ckpt 
                 from perceiver.model.vision.image_classifier.lightning import LitImageClassifier
-
                 source_model = LitImageClassifier.load_from_checkpoint(encoder_params, params=None)
                 state_dict = source_model.model.encoder.state_dict()
             else:
                 from perceiver.model.vision.image_classifier.huggingface import PerceiverImageClassifier
-                #直接加载 HuggingFace模型 
                 source_model = PerceiverImageClassifier.from_pretrained(encoder_params)
                 state_dict = source_model.backend_model.encoder.state_dict()
-
             missing, unexpected = self.model.encoder.load_state_dict(state_dict, strict=False)
             print(f"Loaded pretrained encoder. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
 
-        # Inject LoRA before loading a full anomaly ckpt so keys like ``q_proj.base.*`` / ``lora_*`` match.
+        # LoRA 注入
         if self.hparams.use_lora:
             if self.hparams.lora_rank <= 0:
                 raise ValueError("lora_rank must be positive when use_lora=True")
@@ -152,21 +155,38 @@ class LitAnomalyDetector(LitPerceiverIO):
                 )
 
         self._setup_trainable_parameters()
-
         self.pixel_loss_weight = pixel_loss_weight
         self.image_loss_weight = image_loss_weight
+        self.area_loss_weight = area_loss_weight
+        self.edge_loss_weight = edge_loss_weight
+        self.focal_alpha = focal_alpha
+        self.ranking_loss_weight = ranking_loss_weight
+        self.use_hard_mining = use_hard_mining
+        self.hard_neg_ratio = hard_neg_ratio
 
-        # Register as buffer so it moves with device
         self.register_buffer("pixel_pos_weight", torch.tensor(float(pixel_pos_weight), dtype=torch.float32))
-
         self.image_loss_fn = nn.BCEWithLogitsLoss()
-        self.pixel_auroc, self.image_auroc = make_auroc_metrics()
+
+        self.val_pixel_auroc, self.val_image_auroc = make_auroc_metrics()
+        self.test_pixel_auroc, self.test_image_auroc = make_auroc_metrics()
+
         self._dbg_val_pix_updates = 0
         self._dbg_val_pix_skips = 0
         self._dbg_val_img_updates = 0
         self._dbg_val_img_skips = 0
 
-        
+    def _compute_edge_map(self, x):
+        sobel_x = torch.tensor(
+            [[1, 0, -1], [2, 0, -2], [1, 0, -1]],
+            dtype=torch.float32, device=x.device,
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[1, 2, 1], [0, 0, 0], [-1, -2, -1]],
+            dtype=torch.float32, device=x.device,
+        ).view(1, 1, 3, 3)
+        gx = F.conv2d(x, sobel_x, padding=1)
+        gy = F.conv2d(x, sobel_y, padding=1)
+        return torch.sqrt(gx ** 2 + gy ** 2)
 
     def on_validation_epoch_start(self) -> None:
         self._dbg_val_pix_updates = 0
@@ -187,82 +207,140 @@ class LitAnomalyDetector(LitPerceiverIO):
             return mask.permute(0, 2, 3, 1).contiguous()
         raise ValueError(f"Unsupported mask shape: {tuple(mask.shape)}")
 
+    def _update_image_auroc_no_skip(self, auroc_metric, image_score, true_label):
+        pred = image_score.float().view(-1)
+        true = true_label.long().view(-1)
+        if true.numel() == 0:
+            return False
+        auroc_metric.update(pred, true)
+        return True
+
+    # 均值 Focal Loss（原版，无逐像素）
+    def _focal_bce_with_logits(self, logits, targets, gamma, alpha):
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none', pos_weight=self.pixel_pos_weight.to(logits.device)
+        )
+        p = torch.sigmoid(logits)
+        pt = p * targets + (1.0 - p) * (1.0 - targets)
+        alpha_weight = alpha * targets + (1 - alpha) * (1 - targets)
+        focal_weight = (1.0 - pt).pow(gamma) * alpha_weight
+        return (focal_weight * bce).mean()   # 直接返回均值，不逐像素
+
+    def _compute_ranking_loss(self, pred_logits, y_mask, margin=1.0):
+        anom_mask = (y_mask > 0.5).float()
+        normal_mask = (y_mask <= 0.5).float()
+        if anom_mask.sum() > 0 and normal_mask.sum() > 0:
+            anom_mean = (pred_logits * anom_mask).sum() / (anom_mask.sum() + 1e-8)
+            normal_mean = (pred_logits * normal_mask).sum() / (normal_mask.sum() + 1e-8)
+            loss_rank = torch.relu(margin - (anom_mean - normal_mean))
+        else:
+            loss_rank = torch.tensor(0.0, device=pred_logits.device)
+        return loss_rank
+
     def step(self, batch: Dict[str, Any], stage: str, batch_idx: int = -1):
         x = batch["image"]
         y_mask = self._mask_to_channels_last(batch["mask"]).float()
-
         outputs = self(x)
-        if "anomaly_logits" not in outputs:
-            raise KeyError('Model output must include key "anomaly_logits".')
-
         pred_logits = outputs["anomaly_logits"]
-        if pred_logits.shape != y_mask.shape:
-            raise ValueError(
-                f"Shape mismatch: anomaly_logits={tuple(pred_logits.shape)} vs mask={tuple(y_mask.shape)}"
-            )
 
+        if pred_logits.shape != y_mask.shape:
+            raise ValueError(f"Shape mismatch: {pred_logits.shape} vs {y_mask.shape}")
+
+        # 1. 像素损失（均值 Focal/BCE，不使用逐像素）
         if self.hparams.loss_type == "focal":
-            loss_pix = self._focal_bce_with_logits(
-                pred_logits,
-                y_mask,
-                gamma=float(self.hparams.focal_gamma),
+            loss_pix_bce = self._focal_bce_with_logits(
+                pred_logits, y_mask,
+                gamma=self.hparams.focal_gamma,
+                alpha=self.focal_alpha,
             )
         else:
-            loss_pix = F.binary_cross_entropy_with_logits(
-                pred_logits,
-                y_mask,
+            loss_pix_bce = F.binary_cross_entropy_with_logits(
+                pred_logits, y_mask,
                 pos_weight=self.pixel_pos_weight.to(pred_logits.device),
             )
 
-        #图像集损失不变
+        dice_weight = self.hparams.dice_loss_weight
+        if dice_weight > 0.0:
+            loss_pix_dice = self._soft_dice_loss_with_logits(pred_logits, y_mask, smooth=self.hparams.dice_smooth)
+        else:
+            loss_pix_dice = torch.zeros_like(loss_pix_bce)
+
+        loss_pix = loss_pix_bce + dice_weight * loss_pix_dice
+
+        # 2. 面积损失
+        pred_prob = torch.sigmoid(pred_logits)   # 统一计算一次
+        pred_area = pred_prob.mean(dim=[1, 2, 3])
+        target_area = y_mask.mean(dim=[1, 2, 3])
+        area_loss = F.smooth_l1_loss(pred_area, target_area, beta=0.1) if self.area_loss_weight > 0 else torch.tensor(0.0, device=pred_logits.device)
+
+        # 3. 图像级损失（可选）
         loss_img = torch.tensor(0.0, device=pred_logits.device)
-        use_image_loss = (
-            self.image_loss_weight > 0.0
-            and "image_score" in outputs
-            and "label" in batch
-        )
+        use_image_loss = (self.image_loss_weight > 0.0 and "image_score" in outputs and "label" in batch)
         if use_image_loss:
             image_score = outputs["image_score"].float().view(-1)
             image_label = batch["label"].float().view(-1)
             loss_img = self.image_loss_fn(image_score, image_label)
 
-        #总损失
-        loss = self.pixel_loss_weight * loss_pix + self.image_loss_weight * loss_img
+        # 4. 边缘损失（可选）
+        loss_edge = torch.tensor(0.0, device=pred_logits.device)
+        if self.edge_loss_weight > 0.0:
+            pred_edge = self._compute_edge_map(pred_prob.permute(0, 3, 1, 2))
+            true_edge = self._compute_edge_map(y_mask.permute(0, 3, 1, 2))
+            loss_edge = F.l1_loss(pred_edge, true_edge)
+
+        # 5. Ranking Loss（直接优化 logits 排序）
+        loss_rank = self._compute_ranking_loss(pred_logits, y_mask, margin=1.0)
+
+        # 总损失
+        loss = (self.pixel_loss_weight * loss_pix
+                + self.image_loss_weight * loss_img
+                + self.area_loss_weight * area_loss
+                + self.edge_loss_weight * loss_edge
+                + self.ranking_loss_weight * loss_rank)
 
         bs = x.shape[0]
-        self.log(f"{stage}_loss", loss, prog_bar=(stage != "train"), sync_dist=(stage != "train"), batch_size=bs)
-        self.log(f"{stage}_loss_pix", loss_pix, prog_bar=(stage != "train"), sync_dist=(stage != "train"), batch_size=bs)
+        self.log(f"{stage}_loss", loss, prog_bar=(stage != "train"), batch_size=bs)
+        self.log(f"{stage}_loss_pix", loss_pix, prog_bar=(stage != "train"), batch_size=bs)
+        self.log(f"{stage}_loss_pix_bce", loss_pix_bce, prog_bar=False, batch_size=bs)
+        if dice_weight > 0.0:
+            self.log(f"{stage}_loss_pix_dice", loss_pix_dice, prog_bar=False, batch_size=bs)
         if use_image_loss:
-            self.log(f"{stage}_loss_img", loss_img, prog_bar=False, sync_dist=(stage != "train"), batch_size=bs)
+            self.log(f"{stage}_loss_img", loss_img, prog_bar=False, batch_size=bs)
+        if self.area_loss_weight > 0:
+            self.log(f"{stage}_area_loss", area_loss, prog_bar=False, batch_size=bs)
+            self.log(f"{stage}_pred_area_mean", pred_area.mean(), prog_bar=False, batch_size=bs)
+            self.log(f"{stage}_target_area_mean", target_area.mean(), prog_bar=False, batch_size=bs)
+        if self.ranking_loss_weight > 0:
+            self.log(f"{stage}_loss_rank", loss_rank, prog_bar=False, batch_size=bs)
 
+        # 更新 AUROC
         with torch.no_grad():
-            pred_prob = torch.sigmoid(pred_logits)
-            pix_updated = update_pixel_auroc(self.pixel_auroc, pred_prob, y_mask)
-
-            img_updated = False
-            if "image_score" in outputs and "label" in batch:
-                img_updated = update_image_auroc(self.image_auroc, outputs["image_score"], batch["label"])
-
-        if stage == "val":
-            if pix_updated:
-                self._dbg_val_pix_updates += 1
-            else:
-                self._dbg_val_pix_skips += 1
-            if "image_score" in outputs and "label" in batch:
+            if stage == "val":
+                pix_updated = update_pixel_auroc(self.val_pixel_auroc, pred_prob, y_mask)
+                img_updated = False
+                if "image_score" in outputs and "label" in batch:
+                    img_updated = self._update_image_auroc_no_skip(self.val_image_auroc, outputs["image_score"], batch["label"])
+                if pix_updated:
+                    self._dbg_val_pix_updates += 1
+                else:
+                    self._dbg_val_pix_skips += 1
                 if img_updated:
                     self._dbg_val_img_updates += 1
                 else:
                     self._dbg_val_img_skips += 1
+            elif stage == "test":
+                update_pixel_auroc(self.test_pixel_auroc, pred_prob, y_mask)
+                if "image_score" in outputs and "label" in batch:
+                    self._update_image_auroc_no_skip(self.test_image_auroc, outputs["image_score"], batch["label"])
 
+        # 调试日志
         if stage == "val" and 0 <= batch_idx <= 2:
             tmin, tmax = float(y_mask.min().cpu()), float(y_mask.max().cpu())
             _agent_debug_log(
-                "H2",
-                "lightning.py:step",
-                "val_batch_snapshot",
+                "H2", "lightning.py:step", "val_batch_snapshot",
                 {
-                    "epoch": int(self.current_epoch),
-                    "batch_idx": int(batch_idx),
+                    "epoch": self.current_epoch,
+                    "batch_idx": batch_idx,
                     "mask_mean": float(y_mask.mean().cpu()),
                     "mask_min": tmin,
                     "mask_max": tmax,
@@ -273,10 +351,16 @@ class LitAnomalyDetector(LitPerceiverIO):
                     "pred_logit_mean": float(pred_logits.mean().cpu()),
                     "loss": float(loss.detach().cpu()),
                     "loss_pix": float(loss_pix.detach().cpu()),
-                    "use_lora": bool(self.hparams.use_lora),
-                },
+                    "loss_pix_bce": float(loss_pix_bce.detach().cpu()),
+                    "loss_pix_dice": float(loss_pix_dice.detach().cpu()),
+                    "loss_rank": float(loss_rank.detach().cpu()),
+                    "area_loss": float(area_loss.detach().cpu()),
+                    "pred_area_mean": float(pred_area.mean().cpu()),
+                    "target_area_mean": float(target_area.mean().cpu()),
+                    "area_loss_weight": self.area_loss_weight,
+                    "ranking_loss_weight": self.ranking_loss_weight,
+                }
             )
-
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -291,39 +375,29 @@ class LitAnomalyDetector(LitPerceiverIO):
     def on_before_optimizer_step(self, optimizer) -> None:
         if self.global_step % 25 != 0:
             return
-
         dec_ids = {id(p) for p in self.model.decoder.parameters()}
         lora_params = list(iter_lora_parameters(self.model.encoder))
         lora_ids = {id(p) for p in lora_params}
-
-        total_sq = 0.0
-        lora_sq = 0.0
-        dec_sq = 0.0
-
+        total_sq = 0.0; lora_sq = 0.0; dec_sq = 0.0
         n_trainable_missing_grad = 0
         n_lora_total = len(lora_params)
         n_lora_trainable = 0
         n_lora_grad_none = 0
         n_lora_nonzero_grad = 0
         lora_grad_max = 0.0
-
         for p in self.parameters():
             if not p.requires_grad:
                 continue
-
             if p.grad is None:
                 n_trainable_missing_grad += 1
                 continue
-
             gn_sq = float(p.grad.norm().item() ** 2)
             total_sq += gn_sq
-
             pid = id(p)
             if pid in lora_ids:
                 lora_sq += gn_sq
             elif pid in dec_ids:
                 dec_sq += gn_sq
-
         for p in lora_params:
             if p.requires_grad:
                 n_lora_trainable += 1
@@ -334,115 +408,95 @@ class LitAnomalyDetector(LitPerceiverIO):
                 lora_grad_max = max(lora_grad_max, grad_abs_max)
                 if grad_abs_max > 0:
                     n_lora_nonzero_grad += 1
-
         _agent_debug_log(
-            "H1",
-            "lightning.py:on_before_optimizer_step",
-            "grad_norms",
+            "H1", "lightning.py:on_before_optimizer_step", "grad_norms",
             {
-                "global_step": int(self.global_step),
-                "epoch": int(self.current_epoch),
+                "global_step": self.global_step,
+                "epoch": self.current_epoch,
                 "total_grad_norm": total_sq ** 0.5,
                 "lora_grad_norm": lora_sq ** 0.5,
                 "decoder_grad_norm": dec_sq ** 0.5,
-                "n_trainable_params_missing_grad": int(n_trainable_missing_grad),
-                "n_lora_total": int(n_lora_total),
-                "n_lora_trainable": int(n_lora_trainable),
-                "n_lora_grad_none": int(n_lora_grad_none),
-                "n_lora_nonzero_grad": int(n_lora_nonzero_grad),
-                "lora_grad_max": float(lora_grad_max),
-            },
+                "n_trainable_params_missing_grad": n_trainable_missing_grad,
+                "n_lora_total": n_lora_total,
+                "n_lora_trainable": n_lora_trainable,
+                "n_lora_grad_none": n_lora_grad_none,
+                "n_lora_nonzero_grad": n_lora_nonzero_grad,
+                "lora_grad_max": lora_grad_max,
+            }
         )
 
     def on_validation_epoch_end(self):
-        pixel_auc = compute_and_reset(self.pixel_auroc)
-        image_auc = compute_and_reset(self.image_auroc)
+        pixel_auc = compute_and_reset(self.val_pixel_auroc)
+        image_auc = compute_and_reset(self.val_image_auroc)
         _agent_debug_log(
-            "H2",
-            "lightning.py:on_validation_epoch_end",
-            "val_auroc_rollup",
+            "H2", "lightning.py:on_validation_epoch_end", "val_auroc_rollup",
             {
-                "epoch": int(self.current_epoch),
-                "val_pix_updates": int(self._dbg_val_pix_updates),
-                "val_pix_skips": int(self._dbg_val_pix_skips),
-                "val_img_updates": int(self._dbg_val_img_updates),
-                "val_img_skips": int(self._dbg_val_img_skips),
+                "epoch": self.current_epoch,
+                "val_pix_updates": self._dbg_val_pix_updates,
+                "val_pix_skips": self._dbg_val_pix_skips,
+                "val_img_updates": self._dbg_val_img_updates,
+                "val_img_skips": self._dbg_val_img_skips,
                 "pixel_auc": None if pixel_auc is None else float(pixel_auc.cpu()),
                 "image_auc": None if image_auc is None else float(image_auc.cpu()),
-            },
+            }
         )
         if pixel_auc is not None:
             self.log("val_pixel_auroc", pixel_auc, prog_bar=True, sync_dist=True)
-
         if image_auc is not None:
             self.log("val_image_auroc", image_auc, prog_bar=True, sync_dist=True)
 
     def on_test_epoch_end(self):
-        pixel_auc = compute_and_reset(self.pixel_auroc)
+        pixel_auc = compute_and_reset(self.test_pixel_auroc)
+        image_auc = compute_and_reset(self.test_image_auroc)
         if pixel_auc is not None:
             self.log("test_pixel_auroc", pixel_auc, sync_dist=True)
-
-        image_auc = compute_and_reset(self.image_auroc)
         if image_auc is not None:
             self.log("test_image_auroc", image_auc, sync_dist=True)
 
-    def _focal_bce_with_logits(self, logits, targets, gamma: float):
-        bce = F.binary_cross_entropy_with_logits(
-            logits,
-            targets,
-            reduction="none",
-            pos_weight=self.pixel_pos_weight.to(logits.device),
-        )
-        p = torch.sigmoid(logits)
-        pt = p * targets + (1.0 - p) * (1.0 - targets)
-        return ((1.0 - pt).pow(gamma) * bce).mean()
-    
+    @staticmethod
+    def _soft_dice_loss_with_logits(logits, targets, smooth=1.0):
+        probs = torch.sigmoid(logits)
+        probs = probs.flatten(start_dim=1)
+        targets = targets.flatten(start_dim=1)
+        intersection = (probs * targets).sum(dim=1)
+        denominator = probs.sum(dim=1) + targets.sum(dim=1)
+        dice = (2.0 * intersection + smooth) / (denominator + smooth)
+        return 1.0 - dice.mean()
+
     def _setup_trainable_parameters(self) -> None:
         for p in self.model.encoder.parameters():
             p.requires_grad = False
-
         lora_params = list(iter_lora_parameters(self.model.encoder))
         if self.hparams.use_lora:
             for p in lora_params:
                 p.requires_grad = True
-
         for p in self.model.decoder.parameters():
             p.requires_grad = True
-
         n_lora_total = sum(p.numel() for p in lora_params)
         n_lora_trainable = sum(p.numel() for p in lora_params if p.requires_grad)
         n_decoder_trainable = sum(p.numel() for p in self.model.decoder.parameters() if p.requires_grad)
         n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.parameters())
-
         print(
-            "[trainable] "
-            f"use_lora={bool(self.hparams.use_lora)}, "
-            f"lora_tensors={len(lora_params)}, "
-            f"lora_params={n_lora_total:,}, "
-            f"lora_trainable={n_lora_trainable:,}, "
+            f"[trainable] use_lora={self.hparams.use_lora}, "
+            f"lora_params={n_lora_total:,}, lora_trainable={n_lora_trainable:,}, "
             f"decoder_trainable={n_decoder_trainable:,}, "
             f"total_trainable={n_trainable:,}/{n_total:,}"
         )
-
         _agent_debug_log(
-            "E1",
-            "lightning.py:_setup_trainable_parameters",
-            "trainable_summary",
+            "E1", "lightning.py:_setup_trainable_parameters", "trainable_summary",
             {
-                "use_lora": bool(self.hparams.use_lora),
-                "lora_tensors": int(len(lora_params)),
-                "lora_params": int(n_lora_total),
-                "lora_trainable": int(n_lora_trainable),
-                "decoder_trainable": int(n_decoder_trainable),
-                "total_trainable": int(n_trainable),
-                "total_params": int(n_total),
-            },
+                "use_lora": self.hparams.use_lora,
+                "lora_params": n_lora_total,
+                "lora_trainable": n_lora_trainable,
+                "decoder_trainable": n_decoder_trainable,
+                "total_trainable": n_trainable,
+                "total_params": n_total,
+            }
         )
 
     def configure_optimizers(self):
         dec_lr = float(self.hparams.decoder_lr) if self.hparams.decoder_lr is not None else 1e-4
-
         if self.hparams.use_lora:
             lora_lr = self.hparams.lora_lr
             if lora_lr is None and self.hparams.encoder_lr is not None:
@@ -450,42 +504,15 @@ class LitAnomalyDetector(LitPerceiverIO):
             if lora_lr is None:
                 lora_lr = dec_lr
             lora_lr = float(lora_lr)
-
             lora_params = list(iter_lora_parameters(self.model.encoder))
             dec_params = list(self.model.decoder.parameters())
-
-            n_lora_trainable = sum(p.requires_grad for p in lora_params)
-            n_dec_trainable = sum(p.requires_grad for p in dec_params)
-
-            print(
-                "[optimizer] "
-                f"lora_tensors={len(lora_params)}, "
-                f"lora_trainable_tensors={n_lora_trainable}, "
-                f"decoder_tensors={len(dec_params)}, "
-                f"decoder_trainable_tensors={n_dec_trainable}, "
-                f"lora_lr={lora_lr}, decoder_lr={dec_lr}"
-            )
-
-            _agent_debug_log(
-                "E1",
-                "lightning.py:configure_optimizers",
-                "optimizer_summary",
-                {
-                    "lora_tensors": int(len(lora_params)),
-                    "lora_trainable_tensors": int(n_lora_trainable),
-                    "decoder_tensors": int(len(dec_params)),
-                    "decoder_trainable_tensors": int(n_dec_trainable),
-                    "lora_lr": float(lora_lr),
-                    "decoder_lr": float(dec_lr),
-                },
-            )
-
-            return AdamW(
-                [
-                    {"params": lora_params, "lr": lora_lr},
-                    {"params": dec_params, "lr": dec_lr},
-                ],
+            optimizer = AdamW(
+                [{"params": lora_params, "lr": lora_lr}, {"params": dec_params, "lr": dec_lr}],
                 weight_decay=1e-5,
             )
+        else:
+            optimizer = AdamW(self.model.decoder.parameters(), lr=dec_lr, weight_decay=1e-5)
 
-        return AdamW(self.model.decoder.parameters(), lr=dec_lr, weight_decay=1e-5)
+        # 使用余弦退火调度器
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.trainer.max_epochs)
+        return [optimizer], [{"scheduler": scheduler, "interval": "epoch"}]
