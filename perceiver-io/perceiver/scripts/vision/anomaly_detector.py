@@ -37,14 +37,16 @@ class AnomalyDetectorCLI(CLI):
                 "model.decoder.score_topk_ratio": 0.01,
                 "model.pixel_loss_weight": 1.0, 
                 "model.image_loss_weight": 0.1,
-                "model.pixel_pos_weight": 2.0,  # 像素正类权重（mask 稀疏）
+                "model.pixel_pos_weight": 5.0,  # 像素正类权重（mask 稀疏）
                 "model.loss_type": "bce",
                 "model.focal_gamma": 1.0,
+                "model.dice_loss_weight": 0.1,
+                "model.dice_smooth": 1.0,
                 "model.use_lora": False,
                 "model.lora_rank": 8,
                 "model.lora_alpha": 16.0,
                 "model.lora_dropout": 0.0,
-                "model.lora_target_projs": ["q_proj", "v_proj"],
+                "model.lora_target_projs": ["q_proj","k_proj", "v_proj"],
                 "model.lora_lr": None,
             }
         )
