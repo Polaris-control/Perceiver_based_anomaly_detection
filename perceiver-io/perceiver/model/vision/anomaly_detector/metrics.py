@@ -16,6 +16,7 @@ def make_auroc_metrics():
 
 
 def flatten_pixel_map(x: torch.Tensor) -> torch.Tensor:
+    #统一形状 + 展平为一维，用于计算 AUROC
     """
     (B, H, W, 1) or (B, 1, H, W) -> (B*H*W,)
     """
@@ -50,8 +51,11 @@ def update_image_auroc(image_auroc, image_score: torch.Tensor, true_label: torch
     pred = image_score.float().view(-1)
     true = true_label.long().view(-1)
 
-    if true.numel() == 0 or true.min() == true.max():
+    # 只跳过空 batch，不再检查单类
+    if true.numel() == 0:
         return False
+
+
 
     image_auroc.update(pred, true)
     return True
